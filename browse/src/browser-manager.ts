@@ -16,9 +16,109 @@
  */
 
 import { chromium, type Browser, type BrowserContext, type BrowserContextOptions, type Page, type Locator, type Cookie } from 'playwright';
+import { writeSecureFile, mkdirSecure } from './file-permissions';
 import { addConsoleEntry, addNetworkEntry, addDialogEntry, networkBuffer, type DialogEntry } from './buffers';
+import { emitActivity } from './activity';
 import { validateNavigationUrl } from './url-validation';
 import { TabSession, type RefEntry } from './tab-session';
+import { resolveChromiumProfile, cleanSingletonLocks } from './config';
+import { withCdpSession } from './cdp-bridge';
+import type { MemorySnapshot, MemoryStructureStats, MemoryTabSnapshot, MemoryProcess } from './memory-snapshot';
+
+/**
+ * Detect whether GSTACK_CHROMIUM_PATH points at a custom Chromium build that
+ * already bakes the gstack extension in as a component extension (e.g.,
+ * GStack Browser.app / GBrowser). Passing --load-extension against such a
+ * binary triggers a ServiceWorkerState::SetWorkerId DCHECK because two
+ * copies of the same service worker try to register.
+ *
+ * Resolution:
+ *   1. GSTACK_CHROMIUM_KIND === 'custom-extension-baked' (preferred, explicit)
+ *   2. GSTACK_CHROMIUM_PATH path substring contains 'GBrowser' or 'gbrowser'
+ *      (fallback for callers that only set the path)
+ */
+export function isCustomChromium(): boolean {
+  if (process.env.GSTACK_CHROMIUM_KIND === 'custom-extension-baked') return true;
+  const p = process.env.GSTACK_CHROMIUM_PATH || '';
+  return p.includes('GBrowser') || p.includes('gbrowser');
+}
+
+/**
+ * Decide whether Playwright should request Chromium's sandbox.
+ *
+ * Returns false on Windows (Bun→Node→Chromium chain breaks the sandbox,
+ * GitHub #276) and on Linux under root / CI / container (sandbox needs
+ * unprivileged user namespaces, which are missing for root and typically
+ * disabled in containers).
+ *
+ * When false, Playwright auto-adds --no-sandbox to the launch args — the
+ * desired behavior in those environments. When true, Playwright does NOT
+ * add --no-sandbox, which keeps Chromium's "unsupported command-line flag"
+ * yellow infobar from appearing on every headed launch.
+ *
+ * The headless launch path also pushes an explicit '--no-sandbox' into args
+ * when CI/CONTAINER/root is set; that push is now defensively redundant
+ * (Playwright will add it anyway when this returns false) and harmless.
+ */
+export function shouldEnableChromiumSandbox(): boolean {
+  if (process.platform === 'win32') return false;
+  // Explicit user override for Ubuntu/AppArmor and similar environments where
+  // unprivileged Chromium sandboxing is blocked even for normal users (the
+  // sandbox needs unprivileged user namespaces that the host policy denies,
+  // so /qa hangs without --no-sandbox). Setting GSTACK_CHROMIUM_NO_SANDBOX=1
+  // forces the sandbox off without changing the default for everyone else.
+  // See #1562.
+  if (process.env.GSTACK_CHROMIUM_NO_SANDBOX === '1') return false;
+  const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+  return !(process.env.CI || process.env.CONTAINER || isRoot);
+}
+
+/**
+ * Resolve why the underlying Chromium ChildProcess is going away.
+ *
+ * The 'disconnected' Playwright event fires before the child process emits
+ * its own 'exit' in most cases, so .exitCode is null at that moment. Wait
+ * briefly (capped at 1s) for the exit then read .exitCode + .signalCode:
+ *
+ *   exitCode === 0 && no signal  → 'clean'  (user Cmd+Q, normal shutdown)
+ *   anything else                → 'crash'  (signal-kill, SIGSEGV, OOM, non-zero exit)
+ *
+ * Process supervisors (gbrowser's gbd HealthMonitor in cmd/gbd/health.go)
+ * read our exit code to decide whether to restart. The two callers in this
+ * file ride on top of this: a 'clean' result exits with code 0 (gbd skips
+ * restart, treats as user-intent); a 'crash' result keeps the existing
+ * per-path exit semantics (launch→1, launchHeaded→2, handoff→1) and gbd
+ * restarts on backoff.
+ */
+export async function resolveDisconnectCause(browser: Browser | null): Promise<'clean' | 'crash'> {
+  const proc = browser?.process();
+  if (proc && proc.exitCode === null && proc.signalCode === null) {
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 1000);
+      proc.once('exit', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+  return proc?.exitCode === 0 && proc?.signalCode == null ? 'clean' : 'crash';
+}
+
+/**
+ * Headless `launch()` disconnect handler. Exits 0 on clean user-quit, 1 on
+ * crash. Inlined into the launch() body via a one-line dispatch so
+ * browser-manager's flow stays grep-friendly.
+ */
+export async function handleChromiumDisconnect(browser: Browser | null): Promise<void> {
+  const cause = await resolveDisconnectCause(browser);
+  if (cause === 'clean') {
+    console.error('[browse] Chromium closed cleanly (user-initiated quit). Server exiting (0).');
+    process.exit(0);
+  }
+  console.error('[browse] FATAL: Chromium process crashed or was killed. Server exiting (1).');
+  console.error('[browse] Console/network logs flushed to .gstack/browse-*.log');
+  process.exit(1);
+}
 
 export type { RefEntry };
 
@@ -31,18 +131,43 @@ export interface BrowserState {
     url: string;
     isActive: boolean;
     storage: { localStorage: Record<string, string>; sessionStorage: Record<string, string> } | null;
+    /**
+     * HTML content loaded via load-html (setContent), replayed after context recreation.
+     * In-memory only — never persisted to disk (HTML may contain secrets or customer data).
+     */
+    loadedHtml?: string;
+    loadedHtmlWaitUntil?: 'load' | 'domcontentloaded' | 'networkidle';
+    /**
+     * Tab owner clientId for multi-agent isolation. Survives context recreation so
+     * scoped agents don't get locked out of their own tabs after viewport --scale.
+     * In-memory only.
+     */
+    owner?: string;
   }>;
 }
 
 export class BrowserManager {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
+  // Proxy config applied to chromium.launch() when set (D8). Set by server.ts
+  // at startup based on BROWSE_PROXY_URL. For SOCKS5 with auth, server.ts
+  // points this at the local bridge (socks5://127.0.0.1:<bridgePort>); for
+  // HTTP/HTTPS or unauth SOCKS5, it's the upstream URL directly.
+  private proxyConfig: { server: string; username?: string; password?: string } | null = null;
   private pages: Map<number, Page> = new Map();
   private tabSessions: Map<number, TabSession> = new Map();
   private activeTabId: number = 0;
   private nextTabId: number = 1;
   private extraHeaders: Record<string, string> = {};
   private customUserAgent: string | null = null;
+
+  // ─── Viewport + deviceScaleFactor (context options) ──────────
+  // Tracked at the manager level so recreateContext() preserves them.
+  // deviceScaleFactor is a *context* option, not a page-level setter — changes
+  // require recreateContext(). Viewport width/height can change on-page, but we
+  // track the latest so context recreation restores it instead of hardcoding 1280x720.
+  private deviceScaleFactor: number = 1;
+  private currentViewport: { width: number; height: number } = { width: 1280, height: 720 };
 
   /** Server port — set after server starts, used by cookie-import-browser command */
   public serverPort: number = 0;
@@ -71,6 +196,61 @@ export class BrowserManager {
   // ─── Headed State ────────────────────────────────────────
   private connectionMode: 'launched' | 'headed' = 'launched';
   private intentionalDisconnect = false;
+
+  // ─── Tab Count Guardrail (D5 + Codex single-tab flag) ───────
+  // Idempotent threshold trackers: each guardrail fires exactly once per
+  // upward crossing of its threshold and re-arms when the tab count drops
+  // back below. Pre-guardrail, nothing tracked tab count growth and a
+  // user could accumulate hundreds of tabs (each holding 50–300 MB of
+  // Chromium-side RSS) without warning until the OS OOM-killer fired.
+  // The toast UX lives in the sidebar (extension/sidepanel.js); the
+  // server-side responsibility is the audit-trail activity entry that
+  // appears in the activity feed even when the sidebar is closed.
+  private static readonly TAB_GUARDRAIL_SOFT = 50;
+  private static readonly TAB_GUARDRAIL_HARD = 200;
+  private tabGuardrailSoftHit = false;
+  private tabGuardrailHardHit = false;
+
+  /**
+   * Called from context.on('page') after a new tab is tracked. Emits at
+   * most one activity entry per upward crossing of each threshold.
+   */
+  private checkTabGuardrails(): void {
+    const total = this.pages.size;
+    if (!this.tabGuardrailSoftHit && total >= BrowserManager.TAB_GUARDRAIL_SOFT) {
+      this.tabGuardrailSoftHit = true;
+      const msg = `Tab count crossed ${BrowserManager.TAB_GUARDRAIL_SOFT} (now ${total}). Consider closing unused tabs — each Chromium tab holds 50–300 MB.`;
+      console.warn(`[browse] ${msg}`);
+      emitActivity({ type: 'error', command: 'tab-guardrail', error: msg, tabs: total });
+    }
+    if (!this.tabGuardrailHardHit && total >= BrowserManager.TAB_GUARDRAIL_HARD) {
+      this.tabGuardrailHardHit = true;
+      const msg = `Tab count crossed ${BrowserManager.TAB_GUARDRAIL_HARD} (now ${total}). OOM risk imminent. Open the sidebar to see top RAM consumers.`;
+      console.error(`[browse] ${msg}`);
+      emitActivity({ type: 'error', command: 'tab-guardrail', error: msg, tabs: total });
+    }
+  }
+
+  /** Called from page.on('close') so the guardrails re-arm. */
+  private recheckTabGuardrailsOnClose(): void {
+    const total = this.pages.size;
+    if (this.tabGuardrailSoftHit && total < BrowserManager.TAB_GUARDRAIL_SOFT) {
+      this.tabGuardrailSoftHit = false;
+    }
+    if (this.tabGuardrailHardHit && total < BrowserManager.TAB_GUARDRAIL_HARD) {
+      this.tabGuardrailHardHit = false;
+    }
+  }
+
+  // Called when the headed browser disconnects without intentional teardown
+  // (user closed the window). Wired up by server.ts to run full cleanup
+  // (sidebar-agent, state file, profile locks) before exiting with code 2.
+  // Returns void or a Promise; rejections are caught and fall back to exit(2).
+  // `exitCode` is the resolved process exit code from the disconnect cause:
+  // 0 on clean user-initiated quit (e.g., Cmd+Q on headed Chromium), 2 on
+  // crash/signal-kill. Callers (server.ts) forward it to their shutdown
+  // pipeline so process supervisors (gbrowser's gbd) read the right signal.
+  public onDisconnect: ((exitCode?: number) => void | Promise<void>) | null = null;
 
   getConnectionMode(): 'launched' | 'headed' { return this.connectionMode; }
 
@@ -138,6 +318,15 @@ export class BrowserManager {
   }
 
   /**
+   * Set the proxy config applied to chromium.launch() in launch() and
+   * launchHeaded(). Called by server.ts at startup once the (optional) SOCKS5
+   * bridge is up.
+   */
+  setProxyConfig(cfg: { server: string; username?: string; password?: string } | null): void {
+    this.proxyConfig = cfg;
+  }
+
+  /**
    * Get the ref map for external consumers (e.g., /refs endpoint).
    */
   getRefMap(): Array<{ ref: string; role: string; name: string }> {
@@ -153,23 +342,29 @@ export class BrowserManager {
     // BROWSE_EXTENSIONS_DIR points to an unpacked Chrome extension directory.
     // Extensions only work in headed mode, so we use an off-screen window.
     const extensionsDir = process.env.BROWSE_EXTENSIONS_DIR;
-    const launchArgs: string[] = [];
+    const { STEALTH_LAUNCH_ARGS } = await import('./stealth');
+    const launchArgs: string[] = [...STEALTH_LAUNCH_ARGS];
     let useHeadless = true;
 
-    // Docker/CI: Chromium sandbox requires unprivileged user namespaces which
-    // are typically disabled in containers. Detect container environment and
-    // add --no-sandbox automatically.
-    if (process.env.CI || process.env.CONTAINER) {
+    // Docker/CI/root: Chromium sandbox requires unprivileged user namespaces which
+    // are typically disabled in containers and are never available for the root
+    // user on Linux. Detect all three cases and add --no-sandbox automatically.
+    const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+    if (process.env.CI || process.env.CONTAINER || isRoot) {
       launchArgs.push('--no-sandbox');
     }
 
     if (extensionsDir) {
-      launchArgs.push(
-        `--disable-extensions-except=${extensionsDir}`,
-        `--load-extension=${extensionsDir}`,
-        '--window-position=-9999,-9999',
-        '--window-size=1,1',
-      );
+      // Skip --load-extension when running against a custom Chromium build that
+      // already bakes the extension in (e.g., GBrowser / GStack Browser.app).
+      // Loading it twice causes a ServiceWorkerState::SetWorkerId DCHECK crash.
+      if (!isCustomChromium()) {
+        launchArgs.push(
+          `--disable-extensions-except=${extensionsDir}`,
+          `--load-extension=${extensionsDir}`,
+        );
+      }
+      launchArgs.push('--window-position=-9999,-9999', '--window-size=1,1');
       useHeadless = false; // extensions require headed mode; off-screen window simulates headless
       console.log(`[browse] Extensions loaded from: ${extensionsDir}`);
     }
@@ -178,20 +373,30 @@ export class BrowserManager {
       headless: useHeadless,
       // On Windows, Chromium's sandbox fails when the server is spawned through
       // the Bun→Node process chain (GitHub #276). Disable it — local daemon
-      // browsing user-specified URLs has marginal sandbox benefit.
-      chromiumSandbox: process.platform !== 'win32',
+      // browsing user-specified URLs has marginal sandbox benefit. Also disabled
+      // on Linux root/CI/container, where the sandbox requires unprivileged user
+      // namespaces that aren't available.
+      chromiumSandbox: shouldEnableChromiumSandbox(),
       ...(launchArgs.length > 0 ? { args: launchArgs } : {}),
+      ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
     });
 
-    // Chromium crash → exit with clear message
+    // Chromium disconnect → distinguish clean user-quit from crash. Both
+    // events look identical to Playwright (one 'disconnected' fires), but
+    // the underlying ChildProcess exit code separates them:
+    //   exitCode === 0  → clean quit (user Cmd+Q on macOS, normal shutdown)
+    //   exitCode !== 0  → crash, signal-kill, or OOM
+    // Process supervisors (gbrowser's gbd) consume our exit code: code 0
+    // means "user wanted this, don't restart"; non-zero means "crash, please
+    // bring me back." Without this distinction every Cmd+Q gets treated as
+    // a crash and the user-visible window keeps respawning.
     this.browser.on('disconnected', () => {
-      console.error('[browse] FATAL: Chromium process crashed or was killed. Server exiting.');
-      console.error('[browse] Console/network logs flushed to .gstack/browse-*.log');
-      process.exit(1);
+      void handleChromiumDisconnect(this.browser);
     });
 
     const contextOptions: BrowserContextOptions = {
-      viewport: { width: 1280, height: 720 },
+      viewport: { width: this.currentViewport.width, height: this.currentViewport.height },
+      deviceScaleFactor: this.deviceScaleFactor,
     };
     if (this.customUserAgent) {
       contextOptions.userAgent = this.customUserAgent;
@@ -201,6 +406,13 @@ export class BrowserManager {
     if (Object.keys(this.extraHeaders).length > 0) {
       await this.context.setExtraHTTPHeaders(this.extraHeaders);
     }
+
+    // D7: mask navigator.webdriver only. The other 3 wintermute patches
+    // (plugins, languages, chrome.runtime) are intentionally NOT applied —
+    // faking them to fixed values can flag more bot-like to modern
+    // fingerprinters, not less.
+    const { applyStealth } = await import('./stealth');
+    await applyStealth(this.context);
 
     // Create first tab
     await this.newTab();
@@ -231,19 +443,27 @@ export class BrowserManager {
       '--disable-blink-features=AutomationControlled',
     ];
     if (extensionPath) {
-      launchArgs.push(`--disable-extensions-except=${extensionPath}`);
-      launchArgs.push(`--load-extension=${extensionPath}`);
-      // Write auth token for extension bootstrap.
+      // Skip --load-extension when running against a custom Chromium build
+      // that already bakes the extension in as a component extension
+      // (gbrowser / GStack Browser.app). Loading it twice causes a
+      // ServiceWorkerState::SetWorkerId DCHECK crash.
+      if (!isCustomChromium()) {
+        launchArgs.push(`--disable-extensions-except=${extensionPath}`);
+        launchArgs.push(`--load-extension=${extensionPath}`);
+      }
+      // Write auth token for extension bootstrap (still required even when
+      // the extension is component-baked — it reads ~/.gstack/.auth.json at
+      // startup to learn how to call the daemon).
       // Write to ~/.gstack/.auth.json (not the extension dir, which may be read-only
       // in .app bundles and breaks codesigning).
       if (authToken) {
         const fs = require('fs');
         const path = require('path');
         const gstackDir = path.join(process.env.HOME || '/tmp', '.gstack');
-        fs.mkdirSync(gstackDir, { recursive: true });
+        mkdirSecure(gstackDir);
         const authFile = path.join(gstackDir, '.auth.json');
         try {
-          fs.writeFileSync(authFile, JSON.stringify({ token: authToken, port: this.serverPort || 34567 }), { mode: 0o600 });
+          writeSecureFile(authFile, JSON.stringify({ token: authToken, port: this.serverPort || 34567 }));
         } catch (err: any) {
           console.warn(`[browse] Could not write .auth.json: ${err.message}`);
         }
@@ -256,8 +476,16 @@ export class BrowserManager {
     // so we use Playwright's bundled Chromium which reliably loads extensions.
     const fs = require('fs');
     const path = require('path');
-    const userDataDir = path.join(process.env.HOME || '/tmp', '.gstack', 'chromium-profile');
+    const userDataDir = resolveChromiumProfile();
     fs.mkdirSync(userDataDir, { recursive: true });
+
+    // Pre-launch cleanup of stale SingletonLock/Socket/Cookie. Chromium's
+    // ProcessSingleton refuses to start when these exist from a prior crash
+    // (SIGKILL, hard crash) — the lockfiles point at a PID that may no longer
+    // exist. Shutdown cleanup doesn't run on hard crashes, so we clean here
+    // too. Safe under external coordination: gbd.lock for gbrowser,
+    // single-instance CLI check for gstack.
+    cleanSingletonLocks(userDataDir);
 
     // Support custom Chromium binary via GSTACK_CHROMIUM_PATH env var.
     // Used by GStack Browser.app to point at the bundled Chromium.
@@ -328,10 +556,15 @@ export class BrowserManager {
 
     this.context = await chromium.launchPersistentContext(userDataDir, {
       headless: false,
+      // Match the sandbox policy used by launch() above. Without this,
+      // Playwright auto-adds --no-sandbox on every headed launch and the user
+      // sees Chromium's "unsupported command-line flag" yellow infobar.
+      chromiumSandbox: shouldEnableChromiumSandbox(),
       args: launchArgs,
       viewport: null,  // Use browser's default viewport (real window size)
       userAgent: this.customUserAgent || customUA,
       ...(executablePath ? { executablePath } : {}),
+      ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
       // Playwright adds flags that block extension loading
       ignoreDefaultArgs: [
         '--disable-extensions',
@@ -342,33 +575,20 @@ export class BrowserManager {
     this.connectionMode = 'headed';
     this.intentionalDisconnect = false;
 
-    // ─── Anti-bot-detection stealth patches ───────────────────────
-    // Playwright's Chromium is detected by sites like Google/NYTimes via:
-    //   1. navigator.webdriver = true (handled by --disable-blink-features above)
-    //   2. Missing plugins array (real Chrome has PDF viewer, etc.)
-    //   3. Missing languages
-    //   4. CDP runtime detection (window.cdc_* variables)
-    //   5. Permissions API returning 'denied' for notifications
+    // ─── Anti-bot-detection patches ───────────────────────────────
+    // D7 (codex correction): mask navigator.webdriver only. We do NOT fake
+    // plugins/languages — modern fingerprinters check consistency between
+    // those and userAgent/platform, and synthesizing fixed values can flag
+    // MORE bot-like, not less. Let Chromium's natural plugins and languages
+    // surface unmodified.
+    //
+    // What we DO clean up are automation-specific runtime artifacts that
+    // shouldn't exist in a real browser at all (Permissions API quirks,
+    // ChromeDriver-injected window globals). Those aren't fingerprint
+    // synthesis — they're removing leaked automation tells.
+    const { applyStealth } = await import('./stealth');
+    await applyStealth(this.context);
     await this.context.addInitScript(() => {
-      // Fake plugins array (real Chrome has at least PDF Viewer)
-      Object.defineProperty(navigator, 'plugins', {
-        get: () => {
-          const plugins = [
-            { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: '' },
-            { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: '' },
-          ];
-          (plugins as any).namedItem = (name: string) => plugins.find(p => p.name === name) || null;
-          (plugins as any).refresh = () => {};
-          return plugins;
-        },
-      });
-
-      // Fake languages (Playwright sometimes sends empty)
-      Object.defineProperty(navigator, 'languages', {
-        get: () => ['en-US', 'en'],
-      });
-
       // Remove CDP runtime artifacts that automation detectors look for
       // cdc_ prefixed vars are injected by ChromeDriver/CDP
       const cleanup = () => {
@@ -448,6 +668,7 @@ export class BrowserManager {
       // Inject indicator on the new tab
       page.evaluate(indicatorScript).catch(() => {});
       console.log(`[browse] New tab detected (id=${id}, total=${this.pages.size})`);
+      this.checkTabGuardrails();
     });
 
     // Persistent context opens a default page — adopt it instead of creating a new one
@@ -467,13 +688,45 @@ export class BrowserManager {
       await this.newTab();
     }
 
-    // Browser disconnect handler — exit code 2 distinguishes from crashes (1)
+    // Browser disconnect handler — distinguish user Cmd+Q from real crash.
+    // Clean exit (Chromium exit code 0) → process.exit(0) so process
+    // supervisors (gbrowser's gbd) treat it as user intent and skip the
+    // restart loop. Crash → process.exit(2) preserves the legacy headed
+    // semantics that's distinct from launch()'s code 1.
+    // Always calls onDisconnect() first to trigger full shutdown (kill
+    // sidebar-agent, save session, clean profile locks + state file) so
+    // crashes don't strand resources either.
     if (this.browser) {
       this.browser.on('disconnected', () => {
         if (this.intentionalDisconnect) return;
-        console.error('[browse] Real browser disconnected (user closed or crashed).');
-        console.error('[browse] Run `$B connect` to reconnect.');
-        process.exit(2);
+        const browserRef = this.browser;
+        void (async () => {
+          const cause = await resolveDisconnectCause(browserRef);
+          const exitCode = cause === 'clean' ? 0 : 2;
+          if (cause === 'clean') {
+            console.error('[browse] Real browser closed cleanly (user-initiated quit). Server exiting (0).');
+          } else {
+            console.error('[browse] Real browser disconnected (crash or kill). Server exiting (2).');
+            console.error('[browse] Run `$B connect` to reconnect.');
+          }
+          if (!this.onDisconnect) {
+            process.exit(exitCode);
+            return;
+          }
+          try {
+            const result = this.onDisconnect(exitCode);
+            if (result && typeof (result as Promise<void>).catch === 'function') {
+              (result as Promise<void>).catch((err) => {
+                console.error('[browse] onDisconnect rejected:', err);
+                process.exit(exitCode);
+              });
+            }
+            // onDisconnect is responsible for exit on the success path.
+          } catch (err) {
+            console.error('[browse] onDisconnect threw:', err);
+            process.exit(exitCode);
+          }
+        })();
       });
     }
 
@@ -525,9 +778,12 @@ export class BrowserManager {
   async newTab(url?: string, clientId?: string): Promise<number> {
     if (!this.context) throw new Error('Browser not launched');
 
-    // Validate URL before allocating page to avoid zombie tabs on rejection
+    // Validate URL before allocating page to avoid zombie tabs on rejection.
+    // Use the normalized return value for navigation — it handles file://./x and
+    // file://<segment> cwd-relative forms that the standard URL parser doesn't.
+    let normalizedUrl: string | undefined;
     if (url) {
-      await validateNavigationUrl(url);
+      normalizedUrl = await validateNavigationUrl(url);
     }
 
     const page = await this.context.newPage();
@@ -544,8 +800,8 @@ export class BrowserManager {
     // Wire up console/network/dialog capture
     this.wirePageEvents(page);
 
-    if (url) {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    if (normalizedUrl) {
+      await page.goto(normalizedUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
     }
 
     return id;
@@ -645,14 +901,32 @@ export class BrowserManager {
 
   /**
    * Check if a client can access a tab.
-   * If ownOnly or isWrite is true, requires ownership.
-   * Otherwise (reads), allow by default.
+   *
+   * Two policies, distinguished by `options.ownOnly`:
+   *
+   *   - **own-only (pair-agent over tunnel):** the strict mode. Token must own
+   *     the target tab for any access (reads or writes). Unowned user tabs
+   *     and tabs owned by other clients are off-limits. Remote agents must
+   *     `newtab` first to get a tab they can drive.
+   *
+   *   - **shared (local skill spawns, default scoped tokens):** permissive on
+   *     tab access. The token can read/write any tab — capability is gated
+   *     elsewhere (scope checks at /command, rate limits, the dual-listener
+   *     allowlist for tunnel-bound traffic). Tab ownership is not a security
+   *     boundary for shared tokens; it only matters for pair-agent isolation.
+   *     This matches the contract documented in `skill-token.ts:79`
+   *     ("skill scripts may switch tabs as needed").
+   *
+   * Root is unconstrained.
+   *
+   * `isWrite` is preserved in the signature for callers that want to log or
+   * branch on it elsewhere, but the access decision itself only depends on
+   * `ownOnly` + ownership map state.
    */
   checkTabAccess(tabId: number, clientId: string, options: { isWrite?: boolean; ownOnly?: boolean } = {}): boolean {
     if (clientId === 'root') return true;
-    const owner = this.tabOwnership.get(tabId);
-    if (options.ownOnly || options.isWrite) {
-      if (!owner) return false;
+    if (options.ownOnly) {
+      const owner = this.tabOwnership.get(tabId);
       return owner === clientId;
     }
     return true;
@@ -692,6 +966,80 @@ export class BrowserManager {
     return session;
   }
 
+  /** Get the underlying Page for a tab id. Returns null if the tab doesn't exist.
+   *  Used by the CDP bridge (cdp-bridge.ts) to mint per-tab CDPSessions. */
+  getPageForTab(tabId: number): Page | null {
+    return this.pages.get(tabId) ?? null;
+  }
+
+  // ─── Two-tier mutex (Codex T7) ─────────────────────────────
+  // Per-tab and global locks for the CDP bridge. tab-scoped methods take the
+  // per-tab mutex; browser-scoped methods take the global lock that blocks all
+  // tab mutexes. Hard timeout on acquire so silent deadlock can't happen.
+  // Every caller MUST use try { ... } finally { release() }.
+
+  private tabLocks: Map<number, Promise<void>> = new Map();
+  private globalCdpLockTail: Promise<void> = Promise.resolve();
+
+  /**
+   * Acquire the per-tab CDP lock with a timeout. Returns a release fn.
+   * Locks chain: each acquire waits on the prior tail's resolution.
+   * Browser-scoped global lock takes precedence: while the global lock is
+   * held, no tab lock can be acquired (and vice versa).
+   */
+  async acquireTabLock(tabId: number, timeoutMs: number): Promise<() => void> {
+    const existing = this.tabLocks.get(tabId) ?? Promise.resolve();
+    // Wait for any held global lock first (cross-tier serialization).
+    const tail = Promise.all([existing, this.globalCdpLockTail]).then(() => undefined);
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => { release = resolve; });
+    this.tabLocks.set(tabId, tail.then(() => next));
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(
+        `CDPMutexAcquireTimeout: tab ${tabId} lock not acquired within ${timeoutMs}ms.\n` +
+        'Cause: a prior CDP or browser-scoped operation has held the lock too long.\n' +
+        'Action: retry; if this repeats, the prior operation may be hung — file a bug.'
+      )), timeoutMs),
+    );
+    try {
+      await Promise.race([tail, timeoutPromise]);
+    } catch (e) {
+      // Acquisition failed; release the slot we reserved so we don't deadlock the queue.
+      release();
+      throw e;
+    }
+    return release;
+  }
+
+  /**
+   * Acquire the global CDP lock. Blocks until all tab locks are released, and
+   * blocks new tab-lock acquisitions until released.
+   */
+  async acquireGlobalCdpLock(timeoutMs: number): Promise<() => void> {
+    const allTabTails = Array.from(this.tabLocks.values());
+    const priorGlobal = this.globalCdpLockTail;
+    const allPrior = Promise.all([priorGlobal, ...allTabTails]).then(() => undefined);
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => { release = resolve; });
+    this.globalCdpLockTail = allPrior.then(() => next);
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(
+        `CDPMutexAcquireTimeout: global CDP lock not acquired within ${timeoutMs}ms.\n` +
+        'Cause: in-flight tab operations have not completed.\n' +
+        'Action: retry; if this repeats, file a bug — a tab op may be hung.'
+      )), timeoutMs),
+    );
+    try {
+      await Promise.race([allPrior, timeoutPromise]);
+    } catch (e) {
+      release();
+      throw e;
+    }
+    return release;
+  }
+
   // ─── Page Access (delegates to active session) ─────────────
   getPage(): Page {
     return this.getActiveSession().page;
@@ -703,6 +1051,116 @@ export class BrowserManager {
     } catch {
       return 'about:blank';
     }
+  }
+
+  /**
+   * Diagnostic for `$B memory` and the /memory endpoint.
+   *
+   * Collects:
+   *   - Bun process memory (cross-platform, accurate, no shelling).
+   *   - Per-tab JS heap via CDP Performance.getMetrics — the most portable
+   *     per-tab signal CDP exposes. Misses native/GPU/Skia/cache memory
+   *     (Codex flag on the eng-review; see follow-up TODO "native/GPU
+   *     memory breakdown").
+   *   - Chromium process tree via SystemInfo.getProcessInfo — PID + type
+   *     + CPU time. Per-process RSS is NOT exposed via CDP and the eng
+   *     review (D2 USE_CDP) explicitly chose CDP over shelling to `ps`,
+   *     so RSS columns are absent and `notes[]` says why.
+   *
+   * `structures` is passed in by the caller (read-commands / server) so
+   * browser-manager doesn't take a hard dep on every buffer-owning module.
+   */
+  async getMemorySnapshot(structures: MemoryStructureStats): Promise<MemorySnapshot> {
+    const bunMem = process.memoryUsage();
+    const notes: string[] = [];
+
+    // Per-tab JS heap. Lazy: only the pages we already track. A target
+    // that died mid-snapshot is omitted, never throws.
+    const tabs: MemoryTabSnapshot[] = [];
+    for (const [id, page] of this.pages) {
+      try {
+        const url = (() => { try { return page.url(); } catch { return ''; } })();
+        const title = await page.title().catch(() => '');
+        const metrics = await withCdpSession(page, async (session) => {
+          await session.send('Performance.enable').catch(() => undefined);
+          const result = await session.send('Performance.getMetrics');
+          return ((result as { metrics?: Array<{ name: string; value: number }> }).metrics) ?? [];
+        });
+        const mm: Record<string, number> = {};
+        for (const m of metrics) mm[m.name] = m.value;
+        tabs.push({
+          id,
+          url,
+          title,
+          jsHeapUsed: mm.JSHeapUsedSize ?? 0,
+          jsHeapTotal: mm.JSHeapTotalSize ?? 0,
+          documents: mm.Documents ?? 0,
+          nodes: mm.Nodes ?? 0,
+          listeners: mm.JSEventListeners ?? 0,
+        });
+      } catch {
+        // Target died or CDP unavailable mid-snapshot — skip this tab.
+      }
+    }
+
+    // Chromium process tree. Browser handle may be on the `browser` field
+    // (launched mode) or accessible via `context.browser()` (persistent
+    // context / headed mode); try both.
+    let processes: MemoryProcess[] | null = null;
+    const browser: Browser | null = this.browser ?? (this.context ? this.context.browser() : null);
+    if (browser) {
+      try {
+        // `newBrowserCDPSession` is browser-wide. Not exposed on every
+        // Playwright TypeScript surface, but present at runtime on the
+        // Browser instance — use a typed cast to avoid the @ts-expect-error.
+        type BrowserWithCDP = Browser & {
+          newBrowserCDPSession?: () => Promise<{
+            send: (method: string, params?: unknown) => Promise<unknown>;
+            detach: () => Promise<void>;
+          }>;
+        };
+        const maybeFactory = (browser as BrowserWithCDP).newBrowserCDPSession;
+        if (typeof maybeFactory === 'function') {
+          const browserSession = await maybeFactory.call(browser);
+          try {
+            const info = (await browserSession.send('SystemInfo.getProcessInfo')) as {
+              processInfo?: Array<{ id: number; type: string; cpuTime: number }>;
+            };
+            processes = (info.processInfo ?? []).map((p) => ({
+              id: p.id,
+              type: p.type,
+              cpuTime: p.cpuTime,
+            }));
+            notes.push(
+              'Per-Chromium-process RSS not collected — SystemInfo.getProcessInfo exposes PID+type+CPU only. ' +
+              'See follow-up TODO "native/GPU memory breakdown" for the deferred fix.',
+            );
+          } finally {
+            await browserSession.detach().catch(() => undefined);
+          }
+        } else {
+          notes.push('Playwright build does not expose newBrowserCDPSession; per-process info skipped.');
+        }
+      } catch (err: any) {
+        notes.push(`CDP browser session unavailable: ${err?.message ?? String(err)}`);
+      }
+    } else {
+      notes.push('Browser handle unavailable (server connection mode); per-process info skipped.');
+    }
+
+    return {
+      bunServer: {
+        rss: bunMem.rss,
+        heapUsed: bunMem.heapUsed,
+        heapTotal: bunMem.heapTotal,
+        external: bunMem.external,
+      },
+      tabs,
+      processes,
+      structures,
+      capturedAt: Date.now(),
+      notes,
+    };
   }
 
   // ─── Ref Map (delegates to active session) ──────────────────
@@ -767,6 +1225,7 @@ export class BrowserManager {
 
   // ─── Viewport ──────────────────────────────────────────────
   async setViewport(width: number, height: number) {
+    this.currentViewport = { width, height };
     await this.getPage().setViewportSize({ width, height });
   }
 
@@ -833,10 +1292,21 @@ export class BrowserManager {
           sessionStorage: { ...sessionStorage },
         }));
       } catch {}
+
+      // Capture load-html content so a later context recreation (viewport --scale)
+      // can replay it via setTabContent. Never persisted to disk.
+      const session = this.tabSessions.get(id);
+      const loaded = session?.getLoadedHtml();
+      // Preserve tab ownership through recreation so scoped agents aren't locked out.
+      const owner = this.tabOwnership.get(id);
+
       pages.push({
         url: url === 'about:blank' ? '' : url,
         isActive: id === this.activeTabId,
         storage,
+        loadedHtml: loaded?.html,
+        loadedHtmlWaitUntil: loaded?.waitUntil,
+        owner,
       });
     }
 
@@ -856,25 +1326,49 @@ export class BrowserManager {
       await this.context.addCookies(state.cookies);
     }
 
+    // Clear stale ownership — the old tab IDs are gone. We'll re-add per-tab
+    // owners below as each saved tab gets a fresh ID. Without this reset, old
+    // tabId → clientId entries would linger and match new tabs with the same
+    // sequential IDs, silently granting ownership to the wrong clients.
+    this.tabOwnership.clear();
+
     // Re-create pages
     let activeId: number | null = null;
     for (const saved of state.pages) {
       const page = await this.context.newPage();
       const id = this.nextTabId++;
       this.pages.set(id, page);
-      this.tabSessions.set(id, new TabSession(page));
+      const newSession = new TabSession(page);
+      this.tabSessions.set(id, newSession);
       this.wirePageEvents(page);
 
-      if (saved.url) {
-        // Validate the saved URL before navigating — the state file is user-writable and
-        // a tampered URL could navigate to cloud metadata endpoints or file:// URIs.
+      // Restore tab ownership for the new ID — preserves scoped-agent isolation
+      // across context recreation (viewport --scale, user-agent change, handoff).
+      if (saved.owner) {
+        this.tabOwnership.set(id, saved.owner);
+      }
+
+      if (saved.loadedHtml) {
+        // Replay load-html content via setTabContent — this rehydrates
+        // TabSession.loadedHtml so the next saveState sees it. page.setContent()
+        // alone would restore the DOM but lose the replay metadata.
         try {
-          await validateNavigationUrl(saved.url);
+          await newSession.setTabContent(saved.loadedHtml, { waitUntil: saved.loadedHtmlWaitUntil });
+        } catch (err: any) {
+          console.warn(`[browse] Failed to replay loadedHtml for tab ${id}: ${err.message}`);
+        }
+      } else if (saved.url) {
+        // Validate the saved URL before navigating — the state file is user-writable and
+        // a tampered URL could navigate to cloud metadata endpoints. Use the normalized
+        // return value so file:// forms get consistent treatment with live goto.
+        let normalizedUrl: string;
+        try {
+          normalizedUrl = await validateNavigationUrl(saved.url);
         } catch (err: any) {
           console.warn(`[browse] Skipping invalid URL in state file: ${saved.url} — ${err.message}`);
           continue;
         }
-        await page.goto(saved.url, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+        await page.goto(normalizedUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
       }
 
       if (saved.storage) {
@@ -935,7 +1429,8 @@ export class BrowserManager {
 
       // 3. Create new context with updated settings
       const contextOptions: BrowserContextOptions = {
-        viewport: { width: 1280, height: 720 },
+        viewport: { width: this.currentViewport.width, height: this.currentViewport.height },
+        deviceScaleFactor: this.deviceScaleFactor,
       };
       if (this.customUserAgent) {
         contextOptions.userAgent = this.customUserAgent;
@@ -958,7 +1453,8 @@ export class BrowserManager {
         if (this.context) await this.context.close().catch(() => {});
 
         const contextOptions: BrowserContextOptions = {
-          viewport: { width: 1280, height: 720 },
+          viewport: { width: this.currentViewport.width, height: this.currentViewport.height },
+          deviceScaleFactor: this.deviceScaleFactor,
         };
         if (this.customUserAgent) {
           contextOptions.userAgent = this.customUserAgent;
@@ -971,6 +1467,63 @@ export class BrowserManager {
       }
       return `Context recreation failed: ${err instanceof Error ? err.message : String(err)}. Browser reset to blank tab.`;
     }
+  }
+
+  /**
+   * Change deviceScaleFactor + viewport size atomically.
+   *
+   * deviceScaleFactor is a context-level option, so Playwright requires a full context
+   * recreation. This method validates the input, stores the new values, calls
+   * recreateContext(), and rolls back the fields on failure so a bad call doesn't
+   * leave the manager in an inconsistent state.
+   *
+   * Returns null on success, or an error string if the new context couldn't be built
+   * (state may have been lost, per recreateContext's fallback behavior).
+   */
+  async setDeviceScaleFactor(scale: number, width: number, height: number): Promise<string | null> {
+    if (!Number.isFinite(scale)) {
+      throw new Error(`viewport --scale: value must be a finite number, got ${scale}`);
+    }
+    if (scale < 1 || scale > 3) {
+      throw new Error(`viewport --scale: value must be between 1 and 3 (gstack policy cap), got ${scale}`);
+    }
+    if (this.connectionMode === 'headed') {
+      throw new Error('viewport --scale is not supported in headed mode — scale is controlled by the real browser window.');
+    }
+
+    const prevScale = this.deviceScaleFactor;
+    const prevViewport = { ...this.currentViewport };
+    this.deviceScaleFactor = scale;
+    this.currentViewport = { width, height };
+
+    const err = await this.recreateContext();
+    if (err !== null) {
+      // recreateContext's fallback path built a blank context using the NEW scale +
+      // viewport (the fields we just set). Rolling the fields back without a second
+      // recreate would leave the live context at new-scale while state says old-scale.
+      // Roll back fields FIRST, then force a second recreate against the old values
+      // so live state matches tracked state.
+      this.deviceScaleFactor = prevScale;
+      this.currentViewport = prevViewport;
+      const rollbackErr = await this.recreateContext();
+      if (rollbackErr !== null) {
+        // Second recreate also failed — we're in a clean blank slate via fallback, but
+        // with old scale. Return the original error so the caller sees the primary failure.
+        return `${err} (rollback also encountered: ${rollbackErr})`;
+      }
+      return err;
+    }
+    return null;
+  }
+
+  /** Read current deviceScaleFactor (for tests + debug). */
+  getDeviceScaleFactor(): number {
+    return this.deviceScaleFactor;
+  }
+
+  /** Read current tracked viewport (for tests + `viewport --scale` size fallback). */
+  getCurrentViewport(): { width: number; height: number } {
+    return { ...this.currentViewport };
   }
 
   // ─── Handoff: Headless → Headed ─────────────────────────────
@@ -1019,8 +1572,13 @@ export class BrowserManager {
 
       newContext = await chromium.launchPersistentContext(userDataDir, {
         headless: false,
+        // Match the sandbox policy used by launchHeaded() / launch(). The
+        // handoff path is the headless→headed re-launch and shares the same
+        // anti-detection posture, including no spurious --no-sandbox infobar.
+        chromiumSandbox: shouldEnableChromiumSandbox(),
         args: launchArgs,
         viewport: null,
+        ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
         ignoreDefaultArgs: [
           '--disable-extensions',
           '--disable-component-extensions-with-background-pages',
@@ -1047,12 +1605,14 @@ export class BrowserManager {
         await newContext.setExtraHTTPHeaders(this.extraHeaders);
       }
 
-      // Register crash handler on new browser
+      // Register disconnect handler on new browser. Same clean-vs-crash
+      // discrimination as launch() / launchHeaded() above so a user-initiated
+      // Cmd+Q after a handoff doesn't trigger gbd's restart loop.
       if (this.browser) {
+        const browserRef = this.browser;
         this.browser.on('disconnected', () => {
           if (this.intentionalDisconnect) return;
-          console.error('[browse] FATAL: Chromium process crashed or was killed. Server exiting.');
-          process.exit(1);
+          void handleChromiumDisconnect(browserRef);
         });
       }
 
@@ -1129,6 +1689,7 @@ export class BrowserManager {
           break;
         }
       }
+      this.recheckTabGuardrailsOnClose();
     });
 
     // Clear ref map on navigation — refs point to stale elements after page change
@@ -1197,23 +1758,38 @@ export class BrowserManager {
       }
     });
 
-    // Capture response sizes via response finished
+    // Capture response sizes via requestfinished — but DO NOT call
+    // response.body() here. Pre-fix, this listener materialized every
+    // response body across CDP just to read .length: multi-GB/hour of
+    // Buffer churn on long-lived headed Chromium with media-heavy
+    // pages, the primary Bun-side accelerant on the gbrowser-OOM
+    // investigation. req.sizes() pulls from the Network.loadingFinished
+    // event Chromium already emits — accurate for chunked transfer,
+    // gzip-compressed responses, and streaming media, all the cases
+    // where the previous Content-Length-header approach would have
+    // missed the size.
+    //
+    // The "single context-level CDP listener" architecture (D10's
+    // stretch goal — would reduce per-page listener count from N to 1
+    // via Target.setAutoAttach) is deferred. TODOS.md tracks it.
     page.on('requestfinished', async (req) => {
       try {
-        const res = await req.response();
-        if (res) {
-          const url = req.url();
-          const body = await res.body().catch(() => null);
-          const size = body ? body.length : 0;
-          for (let i = networkBuffer.length - 1; i >= 0; i--) {
-            const entry = networkBuffer.get(i);
-            if (entry && entry.url === url && !entry.size) {
-              networkBuffer.set(i, { ...entry, size });
-              break;
-            }
+        const sizes = await req.sizes().catch(() => null);
+        if (!sizes) return;
+        const url = req.url();
+        const size = sizes.responseBodySize ?? 0;
+        for (let i = networkBuffer.length - 1; i >= 0; i--) {
+          const entry = networkBuffer.get(i);
+          if (entry && entry.url === url && !entry.size) {
+            networkBuffer.set(i, { ...entry, size });
+            break;
           }
         }
-      } catch {}
+      } catch {
+        // Best-effort: requestfinished fires for aborted/cached requests too,
+        // where sizes() is unavailable. Missing size is acceptable; an
+        // unbounded throw would noise the console for every cache hit.
+      }
     });
   }
 }
