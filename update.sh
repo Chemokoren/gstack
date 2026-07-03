@@ -37,8 +37,22 @@ git fetch "$UPSTREAM_REMOTE" "$BRANCH"
 echo "==> Checking out $BRANCH..."
 git checkout "$BRANCH"
 
-echo "==> Merging $UPSTREAM_REMOTE/$BRANCH into local $BRANCH..."
-git merge "$UPSTREAM_REMOTE/$BRANCH" --ff-only
+echo "==> Integrating $UPSTREAM_REMOTE/$BRANCH into local $BRANCH..."
+local_commit=$(git rev-parse "$BRANCH")
+upstream_commit=$(git rev-parse "$UPSTREAM_REMOTE/$BRANCH")
+merge_base=$(git merge-base "$BRANCH" "$UPSTREAM_REMOTE/$BRANCH")
+
+if [ "$local_commit" = "$upstream_commit" ]; then
+    echo "    Local $BRANCH is already up to date."
+elif [ "$local_commit" = "$merge_base" ]; then
+    echo "    Fast-forwarding local $BRANCH..."
+    git merge "$UPSTREAM_REMOTE/$BRANCH" --ff-only
+elif [ "$upstream_commit" = "$merge_base" ]; then
+    echo "    Local $BRANCH is ahead of $UPSTREAM_REMOTE/$BRANCH; keeping local commits."
+else
+    echo "    Local and upstream have diverged; creating an automatic merge commit."
+    git merge "$UPSTREAM_REMOTE/$BRANCH" --no-edit
+fi
 
 echo "==> Pushing to $FORK_REMOTE/$BRANCH..."
 git push "$FORK_REMOTE" "$BRANCH"
