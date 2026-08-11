@@ -717,8 +717,12 @@ function dreamMarkerPid(): number | null {
  *   missing-config → "no local engine; run /setup-gbrain to add local PGLite"
  *   broken-config  → "config file at ~/.gbrain/config.json is malformed; see /setup-gbrain Step 1.5"
  *   broken-db      → "config points at unreachable DB; see /setup-gbrain Step 1.5"
+ *   engine-locked  → PGLite is busy; stop its holder or sync outside the live session
  *   timeout        → kept for Record totality; stages PROCEED on timeout (#1964)
  *                    via the gate's warnProbeTimeout path, never this skip.
+ *   thin-client    → remote-HTTP MCP brain, no local engine by design (#2051);
+ *                    local sync stages skip (gbrain refuses sources/sync there),
+ *                    but suppression gates treat the brain as USABLE.
  */
 function skipStageForLocalStatus(
   stage: "code" | "memory" | "dream",
@@ -733,8 +737,14 @@ function skipStageForLocalStatus(
       "config at ~/.gbrain/config.json is malformed; see /setup-gbrain Step 1.5",
     "broken-db":
       "config points at unreachable DB; see /setup-gbrain Step 1.5",
+    "engine-locked":
+      "PGLite is busy (often held by gbrain serve); stop the holding process or run /sync-gbrain outside the live Claude session, then retry",
     "timeout":
       "engine probe timed out; raise GSTACK_GBRAIN_PROBE_TIMEOUT_MS if your pooler is slow",
+    "thin-client":
+      "thin client (remote-HTTP MCP brain, no local engine by design, #2051); " +
+      "code indexing runs on the brain server, memory syncs via the remote " +
+      "brain's artifacts pull — nothing to do locally",
   };
   const reason = reasons[status as Exclude<LocalEngineStatus, "ok">];
   return {

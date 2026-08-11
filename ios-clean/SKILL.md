@@ -707,7 +707,7 @@ If you are looping on the same diagnostic, same file, or failed fix variants, ST
 
 ## Question Tuning (skip entirely if `QUESTION_TUNING: false`)
 
-Before each AskUserQuestion, choose `question_id` from `scripts/question-registry.ts` or `{skill}-{slug}`, then run `~/.claude/skills/gstack/bin/gstack-question-preference --check "<id>"`. `AUTO_DECIDE` means choose the recommended option and say "Auto-decided [summary] → [option] (your preference). Change with /plan-tune." `ASK_NORMALLY` means ask.
+Before each AskUserQuestion, choose `question_id` from `scripts/question-registry.ts` or `{skill}-{slug}`, then run `printf '%s' "<question summary>" | ~/.claude/skills/gstack/bin/gstack-question-preference --check "<id>" --summary-stdin` (piped summary feeds the one-way keyword net, #2024). `AUTO_DECIDE` means choose the recommended option and say "Auto-decided [summary] → [option] (your preference). Change with /plan-tune." `ASK_NORMALLY` means ask.
 
 **Embed the question_id as a marker in the question text** so hooks can identify it deterministically (plan-tune cathedral T14 / D18 progressive markers). Append `<gstack-qid:{question_id}>` somewhere in the rendered question (the leading line or trailing line is fine; the marker doesn't render visibly to the user when wrapped in HTML-style angle brackets, but the hook strips it). Without the marker the PreToolUse enforcement hook treats the AUQ as observed-only and never auto-decides — so always include it when the question matches a registered `question_id`.
 
@@ -821,9 +821,8 @@ Each item is reverted only after AskUserQuestion confirmation:
 1. The `DebugBridge` SPM target from `Package.swift`.
 2. The `#if DEBUG` block in the app's `@main` entry that calls
    `DebugBridgeManager.shared.start()`.
-3. Any `@Snapshotable` property wrappers on the canonical app state struct
-   (the codegen-detection markers — the wrapper file lives inside
-   DebugBridge so removing the SPM dep removes the wrapper too).
+3. Any standalone `// @Snapshotable` generator marker comments on the
+   canonical app state class.
 4. Generated `StateAccessor.swift` files anywhere under the app source.
 5. The `gstack-ios-qa.token` file under `NSTemporaryDirectory()` on the
    device (best-effort — only works if device is connected when /ios-clean

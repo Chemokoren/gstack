@@ -1,6 +1,6 @@
 {
   "name": "gstack",
-  "version": "1.58.5.0",
+  "version": "1.61.0.0",
   "description": "Garry's Stack — Claude Code skills + fast headless browser. One repo, one install, entire AI engineering workflow.",
   "license": "MIT",
   "type": "module",
@@ -77,5 +77,8 @@
     "@playwright/test": "^1.61.1",
     "xterm": "5",
     "xterm-addon-fit": "^0.8.0"
+  },
+  "overrides": {
+    "basic-ftp": "5.3.1"
   }
 }
